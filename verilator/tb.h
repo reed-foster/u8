@@ -6,6 +6,7 @@
 
 #include <assert.h>
 
+// it is expected that all virtual methods are overridden if they are to be used
 template <class Vmodule> class TESTBENCH
 {
 public:
@@ -15,8 +16,7 @@ public:
     TESTBENCH(void) : m_tickcount(0l)
     {
         m_core = new Vmodule;
-        m_core->clock = 0;
-        eval(); // Get our initial values set properly.
+        initializeinputs();
     }
 
     ~TESTBENCH(void)
@@ -25,30 +25,13 @@ public:
         m_core = NULL;
     }
 
+    virtual void initializeinputs(void) {}
+
     virtual void eval(void) { m_core->eval(); }
 
-    virtual void tick(void)
-    {
-        m_tickcount++;
-        // Make sure we have our evaluations straight before the top
-        // of the clock.  This is necessary since some of the
-        // connection modules may have made changes, for which some
-        // logic depends.  This forces that logic to be recalculated
-        // before the top of the clock.
-        eval();
-        m_core->clock = 1;
-        eval();
-        m_core->clock = 0;
-        eval();
-    }
+    virtual void tick(void) { m_tickcount++; }
 
-    virtual	void reset(void)
-    {
-        m_core->reset = 1;
-        tick();
-        m_core->reset = 0;
-    }
+    virtual	void reset(void) { initializeinputs(); }
 
-    unsigned long tickcount(void) { return m_tickcount; }
     bool done(void) { return (Verilated::gotFinish()); }
 };
