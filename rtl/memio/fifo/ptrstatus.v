@@ -11,30 +11,35 @@ module ptrstatus
         input inc, // enable count
         input clock, reset,
         input [WIDTH-1:0] oppclockptr, // gray-coded pointer of opposite clock domain
-        output [WIDTH-2:0] address, // binary-coded address
         output [WIDTH-1:0] pointer, // gray-coded pointer (equivalent to "address", just gray-coded)
         output status // full (MODE = 0; enqueue) or empty (MODE = 1; dequeue)
     );
 
     // architecture
 
-    // address/pointer temp
-    reg [WIDTH-1:0] binary;
+    wire [WIDTH-1:0] binary;
+    wire [WIDTH-1:0] graynext;
     reg [WIDTH-1:0] gray;
 
     // update counter
     always_ff @(posedge clock) begin
         if (reset)
-            binary <= 0;
+            gray <= 0;
         else if (inc && !status)
-            binary <= binary + 1;
+            gray <= graynext;
     end
 
-    // compact binary to gray conversion, equivalent to {counter[msb], counter[msb-1] ^ counter[msb], ... , counter[1] ^ counter[0]}
-    assign gray = (binary >> 1) ^ binary;
+    // compact gray to binary conversion
+    genvar i;
+    generate for (i = 0; i < WIDTH; i++)
+    begin
+        assign binary[i] = ^(gray >> i);
+    end
+    endgenerate
+    // binary to gray conversion (simultaneously incrementing)
+    assign graynext = ((binary + 1) >> 1) ^ (binary + 1);
 
     // assign outputs
-    assign address = binary[WIDTH-2:0];
     assign pointer = gray;
 
     // since the msb of gray-code is equivalent to the msb of binary code

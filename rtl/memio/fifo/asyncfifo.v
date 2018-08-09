@@ -23,7 +23,6 @@ module asyncfifo
     // synchronizer and pointer/address wires
     wire [ADDRWIDTH:0] enqueue_ptr_sync, dequeue_ptr_sync;
     wire [ADDRWIDTH:0] enqueue_ptr, dequeue_ptr;
-    wire [ADDRWIDTH-1:0] enqueue_addr, dequeue_addr;
 
     // ram
     localparam DEPTH = 2 ** ADDRWIDTH;
@@ -34,13 +33,13 @@ module asyncfifo
         if (reset) // don't need to clear ram
             data_out <= 0;
         else if (dequeue && !empty_t)
-            data_out <= memory[dequeue_addr];
+            data_out <= memory[dequeue_ptr[ADDRWIDTH-1:0]];
     end
     // enqueue
     always_ff @(posedge enq_clock)
     begin
         if (!reset && enqueue && !full_t)
-            memory[enqueue_addr] <= data_in;
+            memory[enqueue_ptr[ADDRWIDTH-1:0]] <= data_in;
     end
 
     // Pointer/Address counters and status
@@ -50,7 +49,6 @@ module asyncfifo
             .clock          (enq_clock),
             .reset          (reset),
             .oppclockptr    (dequeue_ptr_sync),
-            .address        (enqueue_addr),
             .pointer        (enqueue_ptr),
             .status         (full_t)
         );
@@ -60,7 +58,6 @@ module asyncfifo
             .clock          (deq_clock),
             .reset          (reset),
             .oppclockptr    (enqueue_ptr_sync),
-            .address        (dequeue_addr),
             .pointer        (dequeue_ptr),
             .status         (empty_t)
         );
