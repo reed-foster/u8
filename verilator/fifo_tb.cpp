@@ -12,20 +12,25 @@ public:
     void eval(void) { m_core->eval(); }
     void tick(void)
     {
-        m_tickcount++;
-        eval();
-        m_core->clock = 1;
-        eval();
-        m_core->clock = 0;
-        eval();
+        for (int i = 0; i < 2; i++)
+        {
+            m_tickcount++;
+            eval();
+            m_core->clock ^= 1;
+            eval();
+        }
     }
-    void reset(void)
+    void initializeinputs(void)
     {
         m_core->clock = 0;
         m_core->dequeue = 0;
         m_core->enqueue = 0;
         m_core->data_in = 0;
-        m_core->reset = 1;
+        m_core->reset = 0;
+    }
+    void reset(void)
+    {
+        initializeinputs();
         tick();
         m_core->reset = 0;
         eval();
@@ -122,6 +127,7 @@ public:
     }
 };
 
+// main method
 int main(int argc, char **argv, char **env)
 {
     Verilated::commandArgs(argc, argv);
