@@ -1,6 +1,8 @@
 // sdram.v - Reed Foster
 // SDRAM controller (for use with cache controller; hence the odd interface)
 
+// TODO improve full/empty logic on fifos to prevent attempting to write garbage data to/from ram
+
 module sdram
     #( // parameters
         parameter CLOCKPERIOD = 6, // period in ns; CAS latency = 2 requires ckperiod >= 12; otherwise ckperiod >=6
@@ -10,8 +12,8 @@ module sdram
         input ramclock, // clock for controller; same frequency as SDRAM
         input pclock, // processor clock; same frequency as cache and processor (used for read/write to fifos)
         input [23:0] fulladdress, // 2 bits for bank address, 13 for row, and 9 for column
-        input [16:0] d_in, // data from cache
-        output [16:0] d_out, // data to cache
+        input [15:0] d_in, // data from cache
+        output [15:0] d_out, // data to cache
         input readreq, writereq,
         input read, write, // asserted when actually reading from or writing to fifos
         output readready, writeready, // alias for !readfifo.empty and !writefifo.full
@@ -49,14 +51,13 @@ module sdram
     localparam TIMERDEF_refresh_wait = TRC / CLOCKPERIOD; // default = 10
     localparam TIMERDEF_bankactivate = TRCD / CLOCKPERIOD; // default = 3
     localparam TIMERDEF_read_cas_latency = CASLATENCY - 1; // -1 because one cycle of latency is counted in READ state
-    localparam TIMERDEF_read_wait = 509;
+    localparam TIMERDEF_read_wait = 509;get_next_request
     localparam TIMERDEF_write_wait = 511;
     localparam TIMERDEF_idle = 10;
-
     // timer
     reg [17:0] timer = TIMERDEF_init_startup; // only need to use 16 bits, but verilog doesn't know that the minimum value for CLOCKPERIOD is 6
     // update timer
-    always_ff @(posedge clock)
+    always_ff @(posedge ramclock)
     begin
         case (state)
             // init
@@ -71,11 +72,11 @@ module sdram
             INITREFRESH1:   ;
             INITWAIT5:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_idle;
             // idle
-            IDLE:           timer <= (timer > 0) ? timer - 1 : TIMERDEF_refresh_wait;
+            IDLE:           timer <= (timer > 0) ? timer - 1 : TIMERDEF_refresh_wait; // timer gets set to bankact default in state transition logic
             // read
             READBANKACT:    timer <= TIMERDEF_bankactivate;
             READWAIT0:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_read_cas_latency;
-            READ:           timer <= timer - 1; // only one clock cycle occurs here
+            READ:           timer <= timer - 1;
             READWAIT1:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_read_wait;
             READWAIT2:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_idle;
             READBURSTHALT:  ;
@@ -96,6 +97,7 @@ module sdram
         endcase
     end
 
+
     /////////////////////////////////////////////////
     // FSM
     /////////////////////////////////////////////////
@@ -109,7 +111,7 @@ module sdram
     // update FSM on rising clock edge
     reg [STATEWIDTH-1:0] state = INITWAIT0;
     reg [STATEWIDTH-1:0] nextstate;
-    always_ff @(posedge clock)
+    always_ff @(posedge ramclock)
     begin
         state <= nextstate;
     end
@@ -130,6 +132,16 @@ module sdram
             IDLE:
             begin
                 // TODO implement logic
+                if (!requestqueueempty)
+                begin
+                    timer = TIMERDEF_bankactivate;
+                    if (nextrequest[24]) // msb holds request mode (1 for write, 0 for read)
+                        nextstate = WRITEBANKACT;
+                    else
+                        nextstate = READBANKACT;
+                end
+                else
+                    nextstate = (timer == 0) ? REFRESH : state;
             end
             READBANKACT:    nextstate = READWAIT0;
             READWAIT0:      nextstate = (timer == 0) ? READ : state;
@@ -152,14 +164,25 @@ module sdram
         endcase
     end
 
-    ///////////////////////////
+
+    ///////////////////////////////////////////////////////
     // FIFOs
-    ///////////////////////////
+    ///////////////////////////////////////////////////////
+    // request queue
     wire getnextrequest;
     wire requestqueueempty;
     wire [24:0] nextrequest;
-    wire readactive, writeactive;
     assign getnextrequest = (state == IDLE) && (!requestqueueempty);
+    // read/write queues
+    wire readqueue_in, writequeue_out;
+    assign readqueue_in = d_in_iob; // attach fifo i/o to iobs
+    assign d_out_iob = writequeue_out;
+    wire readactive, writeactive;
+    wire readready_n, writeready_n;
+    assign readready = !readready_n;
+    assign writeready = !writeready_n;
+    // dummy signals
+    wire reqfull, readfull, writeempty;
     // fifo instances
     asyncfifo #(.ADDRWIDTH(2), .WIDTH(25)) requestqueue
         (
@@ -170,7 +193,7 @@ module sdram
             .reset      (0),
             .data_in    ({writereq, fulladdress}),
             .data_out   (nextrequest),
-            .full       (0),
+            .full       (reqfull),
             .empty      (requestqueueempty)
         );
     asyncfifo #(.ADDRWIDTH(9), .WIDTH(16)) readqueue
@@ -180,10 +203,10 @@ module sdram
             .dequeue    (read),
             .enqueue    (readactive),
             .reset      (0),
-            .data_in    (),
-            .data_out   (),
-            .full       (),
-            .empty      ()
+            .data_in    (readqueue_in),
+            .data_out   (d_out),
+            .full       (readfull),
+            .empty      (readready_n)
         );
     asyncfifo #(.ADDRWIDTH(9), .WIDTH(16)) writequeue
         (
@@ -192,9 +215,108 @@ module sdram
             .dequeue    (writeactive),
             .enqueue    (write),
             .reset      (0),
-            .data_in    (),
-            .data_out   (),
-            .full       (),
-            .empty      ()
+            .data_in    (d_in),
+            .data_out   (writequeue_out),
+            .full       (writeready_n),
+            .empty      (writeempty)
         );
+
+
+    ///////////////////////////////////////////////
+    // SDRAM control
+    ///////////////////////////////////////////////
+    // commands {cs, ras, cas, we}
+    localparam [3:0] cmd_deselect   = 4'hf;
+    localparam [3:0] cmd_nop        = 4'h7;
+    localparam [3:0] cmd_read       = 4'h5; // A10 must be low
+    localparam [3:0] cmd_write      = 4'h4; // A10 must be low
+    localparam [3:0] cmd_bankact    = 4'h3;
+    localparam [3:0] cmd_precharge  = 4'h2; // A10 must be high
+    localparam [3:0] cmd_refresh    = 4'h1;
+    localparam [3:0] cmd_setmode    = 4'h0; // A10 must be low
+    localparam [3:0] cmd_haltburst  = 4'h6;
+    // control vector (msb->lsb): {address[12:0], udqm, ldqm, ba, cs, ras, cas, we}
+    reg [20:0] controlvec;
+    // dqms must be high during initialization
+    localparam CTLVECDEF_init_nop       = {13'b0, 2'b11, 2'b0, cmd_nop};
+    localparam CTLVECDEF_init_setmode   = {{6'b0, CASLATENCY[2:0], 4'b0111}, 2'b11, 2'b0, cmd_setmode}; // [2:0] to ensure CASLATENCY truncated to 3 bits
+    localparam CTLVECDEF_init_refresh   = {13'b0, 2'b11, 2'b0, cmd_refresh};
+    localparam CTLVECDEF_init_precharge = {{2'b0, 1'b1, 10'b0}, 2'b11, 2'b0, cmd_precharge};
+    // dqms can be held low during non-initialization commands
+    localparam CTLVECDEF_nop            = {13'b0, 2'b0, 2'b0, cmd_nop};
+    localparam CTLVECDEF_bursthalt      = {13'b0, 2'b0, 2'b0, cmd_haltburst};
+    localparam CTLVECDEF_precharge      = {{2'b0, 1'b1, 10'b0}, 2'b0, 2'b0, cmd_precharge};
+    localparam CLTVECDEF_refresh        = {13'b0, 2'b0, 2'b0, cmd_refresh};
+    // update controlvector
+    always_comb
+    begin
+        case(state)
+            INITWAIT0:      controlvec = {13'b0, 1'b0, 2'b11, 2'b0, cmd_deselect};
+            INITWAIT1:      controlvec = CTLVECDEF_init_nop;
+            INITPRECHARGE:  controlvec = CTLVECDEF_init_precharge;
+            INITWAIT2:      controlvec = CTLVECDEF_init_nop;
+            INITSETMODE:    controlvec = CTLVECDEF_init_setmode;
+            INITWAIT3:      controlvec = CTLVECDEF_init_nop;
+            INITREFRESH0:   controlvec = CTLVECDEF_init_refresh;
+            INITWAIT4:      controlvec = CTLVECDEF_init_nop;
+            INITREFRESH1:   controlvec = CTLVECDEF_init_refresh;
+            INITWAIT5:      controlvec = CTLVECDEF_init_nop;
+            IDLE:           controlvec = CTLVECDEF_nop;
+            READBANKACT:    controlvec = {nextrequest[21:9], 2'b0, nextrequest[23:22], cmd_bankact};
+            READWAIT0:      controlvec = CTLVECDEF_nop;
+            READ:           controlvec = {{4'b0, nextrequest[8:0]}, 2'b0, nextrequest[23:22], cmd_read};
+            READWAIT1:      controlvec = CTLVECDEF_nop;
+            READWAIT2:      controlvec = CTLVECDEF_nop;
+            READBURSTHALT:  controlvec = CTLVECDEF_bursthalt;
+            READPRECHARGE:  controlvec = CTLVECDEF_precharge;
+            READWAIT3:      controlvec = CTLVECDEF_nop;
+            READWAIT4:      controlvec = CTLVECDEF_nop;
+            WRITEBANKACT:   controlvec = {nextrequest[21:9], 2'b0, nextrequest[23:22], cmd_bankact};
+            WRITEWAIT0:     controlvec = CTLVECDEF_nop;
+            WRITE:          controlvec = {{4'b0, nextrequest[8:0]}, 2'b0, nextrequest[23:22], cmd_write};
+            WRITEWAIT1:     controlvec = CTLVECDEF_nop;
+            WRITEBURSTHALT: controlvec = CTLVECDEF_bursthalt;
+            WRITEPRECHARGE: controlvec = CTLVECDEF_precharge;
+            WRITEWAIT2:     controlvec = CTLVECDEF_nop;
+            REFRESH:        controlvec = CTLVECDEF_refresh;
+            REFRESHWAIT     controlvec = CTLVECDEF_nop;
+            default         controlvec = CTLVECDEF_nop;
+        endcase
+    end
+
+
+    /////////////////////////////////////////////
+    // IOBs
+    /////////////////////////////////////////////
+    (* IOB = "TRUE" *)
+    reg cke_iob;
+    (* IOB = "TRUE" *)
+    reg [1:0] ba_iob, dqm_iob;
+    (* IOB = "TRUE" *)
+    reg [3:0] cmd_iob;
+    (* IOB = "TRUE" *)
+    reg [12:0] addr_iob;
+    (* IOB = "TRUE" *)
+    reg [15:0] d_in_iob, d_out_iob;
+    // assign controlvec to iobs (din/dout are directly connected to fifos)
+    always_comb
+    begin
+        cke_iob = (state == INITWAIT0) ? 1'b0 : 1'b1;
+        ba_iob = controlvec[5:4];
+        dqm_iob = controlvec[6:7];
+        cmd_iob = controlvec[3:0];
+        addr_iob = controlvec[20:8];
+    end
+    // assign i/o to iob regs
+    assign cke = cke_iob;
+    assign ldqm = dqm_iob[0];
+    assign udqm = dqm_iob[1];
+    assign ba = ba_iob;
+    assign we = cmd_iob[0];
+    assign cas = cmd_iob[1];
+    assign ras = cmd_iob[2];
+    assign cs = cmd_iob[3];
+    assign addr = addr_iob;
+    assign data_to_ram = d_out_iob;
+    assign d_in_iob = data_from_ram;
 endmodule;
