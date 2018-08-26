@@ -1,5 +1,4 @@
 #include "Vfifo.h"
-#include <verilated.h>
 
 #include <stdlib.h> // for rand
 
@@ -18,6 +17,11 @@ public:
             eval();
             m_core->clock ^= 1;
             eval();
+            if (m_trace)
+            {
+                m_trace->dump(10*m_tickcount);
+                m_trace->flush();
+            }
         }
     }
     void initializeinputs(void)
@@ -132,6 +136,7 @@ int main(int argc, char **argv, char **env)
 {
     Verilated::commandArgs(argc, argv);
     FIFO_TB *tb = new FIFO_TB();
+    tb->opentrace("fifo_trace.vcd");
     tb->test_standard(256);
     tb->test_full();
     tb->test_empty();

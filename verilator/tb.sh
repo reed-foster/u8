@@ -7,7 +7,7 @@ tb=$modulename"_tb.cpp"
 echo "====================="
 echo "COMPILING VERILOG"
 echo "====================="
-verilator -Wall --cc $sourcelist --exe $tb
+verilator -Wall --trace --cc $sourcelist --exe $tb
 
 cd obj_dir
 echo "====================="
