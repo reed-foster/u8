@@ -1,5 +1,4 @@
 #include "Vasyncfifo.h"
-#include <verilated.h>
 
 #include <stdlib.h> // for rand
 #include <algorithm> // for std::max
@@ -21,12 +20,16 @@ public:
         if (m_tickcount % DEQCKPERIOD == 0)
             m_core->deq_clock ^= 1;
         if (m_tickcount % ENQCKPERIOD == 0)
-            m_core ->enq_clock ^= 1;
+            m_core->enq_clock ^= 1;
         eval();
+        if (m_trace)
+        {
+            m_trace->dump(m_tickcount);
+            m_trace->flush();
+        }
     }
     void initializeinputs(void)
     {
-        m_tickcount = 0;
         m_core->deq_clock = 0;
         m_core->enq_clock = 0;
         m_core->dequeue = 0;
@@ -45,8 +48,7 @@ public:
 
     void to_rising_edge(CData *clk) // reference to clock port
     {
-        if (*clk == 1)
-            while (*clk != 0) { tick(); }
+        while (*clk != 0) { tick(); }
         while (*clk != 1) { tick(); }
     }
 
@@ -141,6 +143,7 @@ int main(int argc, char **argv, char **env)
 {
     Verilated::commandArgs(argc, argv);
     ASYNCFIFO_TB *tb = new ASYNCFIFO_TB();
+    tb->opentrace("asyncfifo_trace.vcd");
     tb->test_standard();
     tb->test_full();
     tb->test_empty();
