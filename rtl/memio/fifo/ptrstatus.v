@@ -18,6 +18,7 @@ module ptrstatus
     // architecture
 
     wire [WIDTH-1:0] binary;
+    wire [WIDTH-1:0] oppbinary;
     wire [WIDTH-1:0] graynext;
     reg [WIDTH-1:0] gray;
 
@@ -34,6 +35,7 @@ module ptrstatus
     generate for (i = 0; i < WIDTH; i++)
     begin
         assign binary[i] = ^(gray >> i);
+        assign oppbinary[i] = ^(oppclockptr >> i);
     end
     endgenerate
     // binary to gray conversion (simultaneously incrementing)
@@ -45,6 +47,6 @@ module ptrstatus
     // since the msb of gray-code is equivalent to the msb of binary code
     // we don't need to do a gray2binary conversion of oppclockptr
     // XOR with MODE: if msbs are the same (their xor is 0) and module is instantiated in dequeue-mode (MODE = 1), then we want to check when fifo is empty
-    assign status = (oppclockptr[WIDTH-2:0] == gray[WIDTH-2:0]) & (oppclockptr[WIDTH-1] ^ gray[WIDTH-1] ^ MODE);
+    assign status = (oppbinary[WIDTH-2:0] == binary[WIDTH-2:0]) & (oppbinary[WIDTH-1] ^ gray[WIDTH-1] ^ MODE);
 
 endmodule
