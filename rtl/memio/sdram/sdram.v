@@ -18,7 +18,9 @@ module sdram
         input read, write, // asserted when actually reading from or writing to fifos
         output readready, writeready, // alias for !readfifo.empty and !writefifo.full
 
-        // sdram interface (minus clock)
+        // sdram interface
+        // clock to sdram is implemented by oddr2 in topmodule
+        // clock out to sdram should be out of phase by 180deg (probably)
         output cke,
         output udqm, ldqm,
         output [1:0] ba,
@@ -31,29 +33,31 @@ module sdram
 
     // Timing Characteristics (in ns)
     localparam TRC = 60; // row cycle time (same bank)
-    localparam TRFC = 60; // refresh cycle time
     localparam TRCD = 18; // ras# to cas# delay (same bank)
     localparam TRP = 18; // precharge to refresh/row activate (same bank)
-    localparam TRRD = 12; // row activate to row activate (different bank)
     localparam TMRD = 12; // mode register set
-    localparam TRAS = 42; // row activate to precharge (same bank)
-    localparam TWR = 12; // write recovery time
+    localparam TREFI = 7800; // average refresh interval
 
     ////////////////////////////////
     // TIMER
     ////////////////////////////////
     // Timer defaults (convert ns to ticks)
-    localparam TIMERDEF_init_startup = 200000 / CLOCKPERIOD; // countdown for 200us
-    localparam TIMERDEF_init_precharge_setmode = TRP / CLOCKPERIOD; // default = 3
-    localparam TIMERDEF_init_setmode_refresh0 = TMRD / CLOCKPERIOD; // default = 2
-    localparam TIMERDEF_init_refresh0_refresh1 = TRP / CLOCKPERIOD; // default = 3
-    localparam TIMERDEF_init_refresh1_exit = TRC / CLOCKPERIOD; // default = 10
-    localparam TIMERDEF_refresh_wait = TRC / CLOCKPERIOD; // default = 10
-    localparam TIMERDEF_bankactivate = TRCD / CLOCKPERIOD; // default = 3
+    localparam TICK_TRC = TRC / CLOCKPERIOD;
+    localparam TICK_TRCD = TRCD / CLOCKPERIOD;
+    localparam TICK_TRP = TRP / CLOCKPERIOD;
+    localparam TICK_TMRD = TMRD / CLOCKPERIOD;
+    localparam TICK_TREFI = TREFI / CLOCKPERIOD;
+    localparam TIMERDEF_init_startup            = 200000 / CLOCKPERIOD - 2; // countdown for 200us
+    localparam TIMERDEF_init_precharge_setmode  = TICK_TRP > 2  ? TICK_TRP - 2 : 0; // default = 3 - 2
+    localparam TIMERDEF_init_setmode_refresh0   = TICK_TMRD > 2 ? TICK_TMRD - 2 : 0; // default = 2 - 2
+    localparam TIMERDEF_init_refresh0_refresh1  = TICK_TRP > 2 ? TICK_TRP - 2 : 0; // default = 3 - 2
+    localparam TIMERDEF_init_refresh1_exit      = TICK_TRC > 2 ? TICK_TRC - 2 : 0; // default = 10 - 2
+    localparam TIMERDEF_refresh_wait            = TICK_TRC > 2 ? TICK_TRC - 2 : 0; // default = 10 - 2
+    localparam TIMERDEF_bankactivate            = TICK_TRCD > 2 ? TICK_TRCD - 2 : 0; // default = 3 - 2
     localparam TIMERDEF_read_cas_latency = CASLATENCY - 1; // -1 because one cycle of latency is counted in READ state
-    localparam TIMERDEF_read_wait = 509;get_next_request
-    localparam TIMERDEF_write_wait = 511;
-    localparam TIMERDEF_idle = 10;
+    localparam TIMERDEF_read_wait = 512 - 4;
+    localparam TIMERDEF_write_wait = 512 - 2;
+    localparam TIMERDEF_idle = TICK_TREFI / 2; // arbitrary
     // timer
     reg [17:0] timer = TIMERDEF_init_startup; // only need to use 16 bits, but verilog doesn't know that the minimum value for CLOCKPERIOD is 6
     // update timer
@@ -72,7 +76,13 @@ module sdram
             INITREFRESH1:   ;
             INITWAIT5:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_idle;
             // idle
-            IDLE:           timer <= (timer > 0) ? timer - 1 : TIMERDEF_refresh_wait; // timer gets set to bankact default in state transition logic
+            IDLE:
+            begin
+                if (!requestqueueempty)
+                    timer <= TIMERDEF_bankactivate;
+                else
+                    timer <= (timer > 0) ? timer - 1 : TIMERDEF_refresh_wait;
+            end
             // read
             READBANKACT:    timer <= TIMERDEF_bankactivate;
             READWAIT0:      timer <= (timer > 0) ? timer - 1 : TIMERDEF_read_cas_latency;
@@ -134,7 +144,6 @@ module sdram
                 // TODO implement logic
                 if (!requestqueueempty)
                 begin
-                    timer = TIMERDEF_bankactivate;
                     if (nextrequest[24]) // msb holds request mode (1 for write, 0 for read)
                         nextstate = WRITEBANKACT;
                     else
@@ -174,15 +183,19 @@ module sdram
     wire [24:0] nextrequest;
     assign getnextrequest = (state == IDLE) && (!requestqueueempty);
     // read/write queues
-    wire readqueue_in, writequeue_out;
+    wire [15:0] readqueue_in, writequeue_out;
     assign readqueue_in = d_in_iob; // attach fifo i/o to iobs
     assign d_out_iob = writequeue_out;
     wire readactive, writeactive;
+    assign readactive = (state == READWAIT2 || state == READBURSTHALT || state == READPRECHARGE || state == READWAIT3) ? 1 : 0;
+    assign writeactive = (state == WRITE || state == WRITEWAIT1) ? 1 : 0;
     wire readready_n, writeready_n;
     assign readready = !readready_n;
     assign writeready = !writeready_n;
+    // writequeue empty logic
+    wire write_empty;
     // dummy signals
-    wire reqfull, readfull, writeempty;
+    wire reqfull, readfull;
     // fifo instances
     asyncfifo #(.ADDRWIDTH(2), .WIDTH(25)) requestqueue
         (
@@ -238,49 +251,49 @@ module sdram
     // control vector (msb->lsb): {address[12:0], udqm, ldqm, ba, cs, ras, cas, we}
     reg [20:0] controlvec;
     // dqms must be high during initialization
-    localparam CTLVECDEF_init_nop       = {13'b0, 2'b11, 2'b0, cmd_nop};
+    localparam CTLVECDEF_init_deselect  = {13'b0, 2'b11, 2'b0, cmd_deselect};
     localparam CTLVECDEF_init_setmode   = {{6'b0, CASLATENCY[2:0], 4'b0111}, 2'b11, 2'b0, cmd_setmode}; // [2:0] to ensure CASLATENCY truncated to 3 bits
     localparam CTLVECDEF_init_refresh   = {13'b0, 2'b11, 2'b0, cmd_refresh};
     localparam CTLVECDEF_init_precharge = {{2'b0, 1'b1, 10'b0}, 2'b11, 2'b0, cmd_precharge};
     // dqms can be held low during non-initialization commands
-    localparam CTLVECDEF_nop            = {13'b0, 2'b0, 2'b0, cmd_nop};
+    localparam CTLVECDEF_deselect       = {13'b0, 2'b0, 2'b0, cmd_deselect};
     localparam CTLVECDEF_bursthalt      = {13'b0, 2'b0, 2'b0, cmd_haltburst};
     localparam CTLVECDEF_precharge      = {{2'b0, 1'b1, 10'b0}, 2'b0, 2'b0, cmd_precharge};
-    localparam CLTVECDEF_refresh        = {13'b0, 2'b0, 2'b0, cmd_refresh};
+    localparam CTLVECDEF_refresh        = {13'b0, 2'b0, 2'b0, cmd_refresh};
     // update controlvector
     always_comb
     begin
         case(state)
-            INITWAIT0:      controlvec = {13'b0, 1'b0, 2'b11, 2'b0, cmd_deselect};
-            INITWAIT1:      controlvec = CTLVECDEF_init_nop;
+            INITWAIT0:      controlvec = {13'b0, 2'b11, 2'b0, cmd_deselect};
+            INITWAIT1:      controlvec = CTLVECDEF_init_deselect;
             INITPRECHARGE:  controlvec = CTLVECDEF_init_precharge;
-            INITWAIT2:      controlvec = CTLVECDEF_init_nop;
+            INITWAIT2:      controlvec = CTLVECDEF_init_deselect;
             INITSETMODE:    controlvec = CTLVECDEF_init_setmode;
-            INITWAIT3:      controlvec = CTLVECDEF_init_nop;
+            INITWAIT3:      controlvec = CTLVECDEF_init_deselect;
             INITREFRESH0:   controlvec = CTLVECDEF_init_refresh;
-            INITWAIT4:      controlvec = CTLVECDEF_init_nop;
+            INITWAIT4:      controlvec = CTLVECDEF_init_deselect;
             INITREFRESH1:   controlvec = CTLVECDEF_init_refresh;
-            INITWAIT5:      controlvec = CTLVECDEF_init_nop;
-            IDLE:           controlvec = CTLVECDEF_nop;
+            INITWAIT5:      controlvec = CTLVECDEF_init_deselect;
+            IDLE:           controlvec = CTLVECDEF_deselect;
             READBANKACT:    controlvec = {nextrequest[21:9], 2'b0, nextrequest[23:22], cmd_bankact};
-            READWAIT0:      controlvec = CTLVECDEF_nop;
+            READWAIT0:      controlvec = CTLVECDEF_deselect;
             READ:           controlvec = {{4'b0, nextrequest[8:0]}, 2'b0, nextrequest[23:22], cmd_read};
-            READWAIT1:      controlvec = CTLVECDEF_nop;
-            READWAIT2:      controlvec = CTLVECDEF_nop;
+            READWAIT1:      controlvec = CTLVECDEF_deselect;
+            READWAIT2:      controlvec = CTLVECDEF_deselect;
             READBURSTHALT:  controlvec = CTLVECDEF_bursthalt;
             READPRECHARGE:  controlvec = CTLVECDEF_precharge;
-            READWAIT3:      controlvec = CTLVECDEF_nop;
-            READWAIT4:      controlvec = CTLVECDEF_nop;
+            READWAIT3:      controlvec = CTLVECDEF_deselect;
+            READWAIT4:      controlvec = CTLVECDEF_deselect;
             WRITEBANKACT:   controlvec = {nextrequest[21:9], 2'b0, nextrequest[23:22], cmd_bankact};
-            WRITEWAIT0:     controlvec = CTLVECDEF_nop;
+            WRITEWAIT0:     controlvec = CTLVECDEF_deselect;
             WRITE:          controlvec = {{4'b0, nextrequest[8:0]}, 2'b0, nextrequest[23:22], cmd_write};
-            WRITEWAIT1:     controlvec = CTLVECDEF_nop;
+            WRITEWAIT1:     controlvec = CTLVECDEF_deselect;
             WRITEBURSTHALT: controlvec = CTLVECDEF_bursthalt;
             WRITEPRECHARGE: controlvec = CTLVECDEF_precharge;
-            WRITEWAIT2:     controlvec = CTLVECDEF_nop;
+            WRITEWAIT2:     controlvec = CTLVECDEF_deselect;
             REFRESH:        controlvec = CTLVECDEF_refresh;
-            REFRESHWAIT     controlvec = CTLVECDEF_nop;
-            default         controlvec = CTLVECDEF_nop;
+            REFRESHWAIT:    controlvec = CTLVECDEF_deselect;
+            default:        controlvec = CTLVECDEF_deselect;
         endcase
     end
 
@@ -301,9 +314,9 @@ module sdram
     // assign controlvec to iobs (din/dout are directly connected to fifos)
     always_comb
     begin
-        cke_iob = (state == INITWAIT0) ? 1'b0 : 1'b1;
+        cke_iob = (state == INITWAIT0 || (writeactive && writeempty)) ? 1'b0 : 1'b1;
         ba_iob = controlvec[5:4];
-        dqm_iob = controlvec[6:7];
+        dqm_iob = controlvec[7:6];
         cmd_iob = controlvec[3:0];
         addr_iob = controlvec[20:8];
     end
