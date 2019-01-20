@@ -193,7 +193,7 @@ module sdram
     assign readready = !readready_n;
     assign writeready = !writeready_n;
     // writequeue empty logic
-    wire write_empty;
+    wire writeempty;
     // dummy signals
     wire reqfull, readfull;
     // fifo instances
