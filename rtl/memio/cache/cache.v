@@ -21,7 +21,7 @@ module cache
         input [15:0] data_from_ram, // data to cache
         output readreq, writereq,
         output read, write, // asserted when actually reading from or writing to fifos
-        input readready, writeready, // alias for !readfifo.empty and !writefifo.full
+        input readready, writeready // alias for !readfifo.empty and !writefifo.full
     );
 
     // architecture
