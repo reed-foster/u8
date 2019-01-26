@@ -10,38 +10,68 @@ module usbfifo
         input txe, // low when data can be written to fifo
         output rd, // active low
         output wr, // active low
-        inout [7:0] data,
-        output [7:0] leds,
+        inout [7:0] data_tristate,
 
         input clock // internal logic must be synchronous
     );
 
     // architecture
+    reg datavalid = 0;
+    reg [7:0] data;
 
-    // increment received word by 1
-    wire [7:0] tx_data;
-    reg [7:0] word;
-    assign data = rxf ? word + 8'b1 : 8'bZ; // output data when not reading
-    assign leds = word;
+    assign data_tristate = (state == TXDATA || state == TXWRLO) ? data : 8'bZ;
+    assign rd = (state == RXRDLO || state == RXDATA) ? 0 : 1;
+    assign wr = (state == TXWRLO || state == TXWAIT) ? 0 : 1;
 
-    // synchronize rxf and txe signals
-    reg s_rxf = 1; // active low
-    reg s_txe = 1; // active low
-    assign rd = s_rxf;
-    assign wr = s_txe;
-
-    // trd (read -> data) is < 14ns so 50MHz clock is fine
-    // tdw (data -> write) is > 5ns; 50MHz is definitely fine
+    //////////////////////////////
+    // timer
+    //////////////////////////////
+    localparam TIMERDEF = 2;
+    reg [1:0] timer = TIMERDEF;
+    // update timer
     always @ (posedge clock)
     begin
-        s_rxf <= rxf;
-        s_txe <= txe;
+        if (state == WAIT) // only count down if we're waiting
+            timer <= (timer > 0) ? timer - 1 : TIMERDEF;
     end
 
-    always @ (negedge clock)
+    //////////////////////////////
+    // FSM
+    //////////////////////////////
+    localparam STATEWIDTH = 3;
+    localparam IDLE = 0;
+    localparam TXDATA = 1, TXWRLO = 2, TXWAIT = 3, TXWRHI = 4;
+    localparam RXRDLO = 5, RXDATA = 6;
+    localparam WAIT = 7;
+    reg [STATEWIDTH-1:0] state = IDLE;
+    reg [STATEWIDTH-1:0] nextstate;
+    always @ (posedge clock)
     begin
-        if (s_rxf == 0) // s_rxf must've been low for half a clock period
-            word <= data;
+        state <= nextstate;
+    end
+    always @ ( * )
+    begin
+        case (state)
+            IDLE:   nextstate = (txe == 0 && datavalid == 1) ? TXDATA : (rxf == 0) ? RXRDLO : state;
+            TXDATA: nextstate = TXWRLO;
+            TXWRLO: nextstate = TXWAIT;
+            TXWAIT: nextstate = TXWRHI;
+            TXWRHI: nextstate = WAIT;
+            RXRDLO: nextstate = RXDATA;
+            RXDATA: nextstate = WAIT;
+            WAIT:   nextstate = (timer == 0) ? IDLE : state;
+        endcase
+    end
+
+    always @ (posedge clock)
+    begin
+        if (state == RXDATA)
+        begin
+            datavalid <= 1;
+            data <= data_tristate;
+        end
+        if (state == TXDATA)
+            datavalid <= 0;
     end
 
 endmodule
